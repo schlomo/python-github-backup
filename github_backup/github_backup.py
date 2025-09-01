@@ -27,7 +27,13 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 # GitHub App authentication imports
-import jwt
+try:
+    import jwt
+except ImportError:
+    raise ImportError(
+        "PyJWT library is required for GitHub App authentication. "
+        "Install it with: pip install PyJWT>=2.0.0 cryptography>=3.0.0"
+    )
 
 try:
     from . import __version__
