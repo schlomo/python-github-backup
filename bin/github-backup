@@ -14,6 +14,7 @@ from github_backup.github_backup import (
     mkdir_p,
     parse_args,
     retrieve_repositories,
+    validate_args,
 )
 
 logging.basicConfig(
@@ -25,6 +26,7 @@ logging.basicConfig(
 
 def main():
     args = parse_args()
+    validate_args(args)
 
     if args.quiet:
         logger.setLevel(logging.WARNING)

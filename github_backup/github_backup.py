@@ -19,12 +19,15 @@ import ssl
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.client import IncompleteRead
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote as urlquote
 from urllib.parse import urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+
+# GitHub App authentication imports
+import jwt
 
 try:
     from . import __version__
@@ -36,6 +39,11 @@ except ImportError:
 FNULL = open(os.devnull, "w")
 FILE_URI_PREFIX = "file://"
 logger = logging.getLogger(__name__)
+
+# Global variables for GitHub App token management
+_github_app_token = None
+_github_app_token_expires = None
+_github_app_credentials = None
 
 https_ctx = ssl.create_default_context()
 if not https_ctx.get_ca_certs():
@@ -159,6 +167,21 @@ def parse_args(args=None):
         action="store_true",
         dest="as_app",
         help="authenticate as github app instead of as a user.",
+    )
+    parser.add_argument(
+        "--app-id",
+        dest="app_id",
+        help="GitHub App ID for app authentication",
+    )
+    parser.add_argument(
+        "--installation-id", 
+        dest="installation_id",
+        help="GitHub App Installation ID for app authentication",
+    )
+    parser.add_argument(
+        "--private-key",
+        dest="private_key",
+        help="GitHub App private key (PEM format) or path to private key file (file://...)",
     )
     parser.add_argument(
         "-o",
@@ -440,8 +463,80 @@ def parse_args(args=None):
     return parser.parse_args(args)
 
 
+def validate_args(args):
+    """Validate argument combinations and dependencies."""
+    # Auto-enable --as-app when GitHub App credentials are provided
+    if args.app_id and args.installation_id and args.private_key:
+        if not args.as_app:
+            logger.info("GitHub App credentials provided. Automatically enabling --as-app mode.")
+            args.as_app = True
+    
+    # GitHub App authentication validation
+    if args.as_app:
+        # Check if user provided GitHub App credentials
+        app_creds_provided = bool(args.app_id and args.installation_id and args.private_key)
+        # Check if user provided a token
+        token_provided = bool(args.token_classic)
+        
+        if not app_creds_provided and not token_provided:
+            raise Exception(
+                "When using --as-app, you must provide either:\n"
+                "  1. GitHub App credentials: --app-id, --installation-id, --private-key, OR\n"
+                "  2. A pre-generated installation token: --token"
+            )
+        
+        if app_creds_provided and token_provided:
+            raise Exception(
+                "Cannot use both GitHub App credentials (--app-id, --installation-id, --private-key) "
+                "and pre-generated token (--token) simultaneously. Choose one approach."
+            )
+    
+    # Validate that GitHub App credentials are complete if any are provided
+    app_cred_args = [args.app_id, args.installation_id, args.private_key]
+    app_creds_partial = any(app_cred_args) and not all(app_cred_args)
+    
+    if app_creds_partial:
+        missing = []
+        if not args.app_id:
+            missing.append("--app-id")
+        if not args.installation_id:
+            missing.append("--installation-id") 
+        if not args.private_key:
+            missing.append("--private-key")
+        
+        raise Exception(
+            f"Incomplete GitHub App credentials. Missing: {', '.join(missing)}\n"
+            "All three are required: --app-id, --installation-id, --private-key"
+        )
+
+
 def get_auth(args, encode=True, for_git_cli=False):
+    global _github_app_credentials
     auth = None
+
+    # Handle GitHub App authentication
+    if args.app_id and args.installation_id and args.private_key:
+        if not args.as_app:
+            logger.warning("GitHub App credentials provided but --as-app not specified. Enabling app authentication.")
+            args.as_app = True
+        
+        # Store credentials globally for token refresh
+        _github_app_credentials = (args.app_id, args.installation_id, args.private_key)
+        
+        # Get fresh token
+        token = get_or_refresh_github_app_token()
+        if not token:
+            raise Exception("Failed to generate GitHub App installation token")
+        
+        if not for_git_cli:
+            auth = token
+        else:
+            auth = "x-access-token:" + token
+            
+        # For GitHub App tokens, we don't need to encode
+        if not encode or not for_git_cli:
+            return auth
+        return base64.b64encode(auth.encode("ascii"))
 
     if args.osx_keychain_item_name:
         if not args.osx_keychain_item_account:
@@ -516,6 +611,71 @@ def get_auth(args, encode=True, for_git_cli=False):
     return base64.b64encode(auth.encode("ascii"))
 
 
+def generate_github_app_token(app_id, installation_id, private_key):
+    """Generate an installation access token for GitHub App authentication."""
+    try:
+        # Load private key
+        if private_key.startswith(FILE_URI_PREFIX):
+            private_key = read_file_contents(private_key)
+        
+        # Create JWT payload
+        now = int(time.time())
+        payload = {
+            "iat": now - 60,  # Issued at (1 minute ago to account for clock skew)
+            "exp": now + 600,  # Expires in 10 minutes (max allowed)
+            "iss": int(app_id)  # Issuer (GitHub App ID)
+        }
+        
+        # Generate JWT
+        jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
+        
+        # Request installation access token
+        url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+        headers = {
+            "Authorization": f"Bearer {jwt_token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": f"github-backup/{VERSION}"
+        }
+        
+        request = Request(url, headers=headers, method="POST")
+        request.data = b""  # Empty POST body
+        
+        response = urlopen(request, context=https_ctx)
+        data = json.loads(response.read().decode("utf-8"))
+        
+        token = data["token"]
+        expires_at = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+        
+        logger.info(f"Generated GitHub App installation token (expires at {expires_at})")
+        return token, expires_at
+        
+    except Exception as e:
+        raise Exception(f"Failed to generate GitHub App token: {str(e)}")
+
+
+def get_or_refresh_github_app_token():
+    """Get current GitHub App token or refresh it if expired/missing."""
+    global _github_app_token, _github_app_token_expires, _github_app_credentials
+    
+    if not _github_app_credentials:
+        return None
+        
+    app_id, installation_id, private_key = _github_app_credentials
+    
+    # Check if we need a new token (5 minutes buffer before expiry)
+    now = datetime.now().replace(tzinfo=None)
+    if (_github_app_token is None or 
+        _github_app_token_expires is None or 
+        now >= (_github_app_token_expires.replace(tzinfo=None) - timedelta(minutes=5))):
+        
+        logger.info("Generating new GitHub App token...")
+        _github_app_token, _github_app_token_expires = generate_github_app_token(
+            app_id, installation_id, private_key
+        )
+    
+    return _github_app_token
+
+
 def get_github_api_host(args):
     if args.github_host:
         host = args.github_host + "/api/v3"
@@ -572,7 +732,6 @@ def get_github_repo_url(args, repository):
 
 
 def retrieve_data_gen(args, template, query_args=None, single_request=False):
-    auth = get_auth(args, encode=not args.as_app)
     query_args = get_query_args(query_args)
     per_page = 100
     page = 0
@@ -584,16 +743,19 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False):
             page = page + 1
             request_page, request_per_page = page, per_page
 
+        # Get fresh auth on each request to handle token refresh
+        auth = get_auth(args, encode=not args.as_app)
+        
         request = _construct_request(
-            request_per_page,
             request_page,
+            request_per_page,
             query_args,
             template,
             auth,
             as_app=args.as_app,
             fine=True if args.token_fine is not None else False,
         )  # noqa
-        r, errors = _get_response(request, auth, template)
+        r, errors = _get_response(request, auth, template, args)
 
         status_code = int(r.getcode())
         # Check if we got correct data
@@ -687,7 +849,7 @@ def get_query_args(query_args=None):
     return query_args
 
 
-def _get_response(request, auth, template):
+def _get_response(request, auth, template, args=None):
     retry_timeout = 3
     errors = []
     # We'll make requests in a loop so we can
@@ -697,8 +859,35 @@ def _get_response(request, auth, template):
         try:
             r = urlopen(request, context=https_ctx)
         except HTTPError as exc:
-            errors, should_continue = _request_http_error(exc, auth, errors)  # noqa
+            errors, should_continue = _request_http_error(exc, auth, errors, args)  # noqa
             r = exc
+            
+            # If token was refreshed, we need to reconstruct the request with new auth
+            if should_continue and args and _github_app_credentials:
+                new_auth = get_auth(args, encode=not args.as_app)
+                if new_auth != auth:
+                    # Extract the original URL from the request 
+                    original_url = request.get_full_url()
+                    
+                    # Parse URL to get query parameters
+                    parsed_url = urlparse(original_url)
+                    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+                    
+                    # Reconstruct the request with new auth
+                    request = Request(original_url)
+                    
+                    # Set the new authorization header
+                    if not args.as_app:
+                        request.add_header("Authorization", f"Basic {new_auth.decode('ascii')}")
+                    else:
+                        if args.token_fine:
+                            request.add_header("Authorization", f"token {new_auth}")
+                        else:
+                            request.add_header("Authorization", f"token {new_auth}")
+                    
+                    request.add_header("User-Agent", f"github-backup/{VERSION}")
+                    auth = new_auth  # Update local auth variable
+                    
         except URLError as e:
             logger.warning(e.reason)
             should_continue, retry_timeout = _request_url_error(template, retry_timeout)
@@ -756,7 +945,7 @@ def _construct_request(
     return request
 
 
-def _request_http_error(exc, auth, errors):
+def _request_http_error(exc, auth, errors, args=None):
     # HTTPError behaves like a Response so we can
     # check the status code and headers to see exactly
     # what failed.
@@ -765,7 +954,24 @@ def _request_http_error(exc, auth, errors):
     headers = exc.headers
     limit_remaining = int(headers.get("x-ratelimit-remaining", 0))
 
-    if exc.code == 403 and limit_remaining < 1:
+    # Handle GitHub App token expiry (401 Unauthorized)
+    if exc.code == 401 and _github_app_credentials is not None:
+        logger.warning("GitHub App token expired (401 Unauthorized). Refreshing token...")
+        try:
+            # Force refresh the token
+            global _github_app_token, _github_app_token_expires
+            _github_app_token = None  # Force regeneration
+            _github_app_token_expires = None
+            
+            new_token = get_or_refresh_github_app_token()
+            if new_token:
+                logger.info("Successfully refreshed GitHub App token")
+                should_continue = True
+            else:
+                logger.error("Failed to refresh GitHub App token")
+        except Exception as e:
+            logger.error(f"Error refreshing GitHub App token: {str(e)}")
+    elif exc.code == 403 and limit_remaining < 1:
         # The X-RateLimit-Reset header includes a
         # timestamp telling us when the limit will reset
         # so we can calculate how long to wait rather
