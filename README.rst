@@ -171,6 +171,146 @@ Customise the permissions for your use case, but for a personal account full bac
 **Repository permissions**: Read access to contents, issues, metadata, pull requests, and webhooks.
 
 
+GitHub App Authentication
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For backing up entire organizations, **GitHub App authentication** (``--as-app``) is often the most effective approach as it provides broader access across organization repositories and higher rate limits.
+
+Creating a GitHub App for Organization Backup
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+1. **Create the GitHub App**:
+   
+   * Go to your organization's settings: ``https://github.com/organizations/YOUR_ORG/settings/apps``
+   * Click "New GitHub App"
+   * Fill in basic information:
+     - App name: e.g., "Organization Backup Tool" 
+     - Homepage URL: Can be your organization's website
+     - Webhook URL: Not required, can leave blank or use a placeholder
+
+2. **Configure Permissions**:
+
+   **Repository permissions** (select "Read" access for):
+   
+   * Contents
+   * Issues  
+   * Metadata
+   * Pull requests
+   * Webhooks
+   * Repository projects (if backing up projects)
+
+   **Organization permissions** (select "Read" access for):
+   
+   * Members
+   * Metadata
+
+   **Account permissions** (select "Read" access for):
+   
+   * Starring
+   * Watching
+
+3. **Installation Settings**:
+   
+   * Set "Where can this GitHub App be installed?" to "Only on this account" for security
+   * Under "Repository access", choose "All repositories" to backup the entire organization
+
+4. **Generate Keys**:
+   
+   * After creating the app, go to "General" tab and scroll down to "Private keys"
+   * Click "Generate a private key" and download the ``.pem`` file safely
+
+5. **Install the App**:
+   
+   * Go to "Install App" tab in your app settings
+   * Click "Install" next to your organization
+   * Choose "All repositories" or select specific repositories you want to backup
+
+Generating Installation Access Tokens
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+GitHub Apps use installation access tokens that expire after 1 hour. You'll need to generate these programmatically:
+
+**Option 1: Using GitHub CLI (recommended for manual runs)**::
+
+    # Install GitHub CLI if not already installed
+    # https://cli.github.com/
+    
+    # Generate installation access token
+    gh auth token --hostname github.com --scopes repo
+
+**Option 2: Using a script for automation**:
+
+You can create a script to generate tokens using your app's private key. Here's a basic approach using Python::
+
+    import jwt
+    import time
+    import requests
+    
+    # Your GitHub App details
+    app_id = "YOUR_APP_ID"
+    private_key_path = "path/to/your/private-key.pem"
+    installation_id = "YOUR_INSTALLATION_ID"  # Find this in app settings
+    
+    # Generate JWT
+    with open(private_key_path, 'r') as key_file:
+        private_key = key_file.read()
+    
+    payload = {
+        'iat': int(time.time()),
+        'exp': int(time.time()) + 600,  # 10 minutes
+        'iss': app_id
+    }
+    
+    jwt_token = jwt.encode(payload, private_key, algorithm='RS256')
+    
+    # Get installation access token
+    headers = {
+        'Authorization': f'Bearer {jwt_token}',
+        'Accept': 'application/vnd.github.v3+json'
+    }
+    
+    response = requests.post(
+        f'https://api.github.com/app/installations/{installation_id}/access_tokens',
+        headers=headers
+    )
+    
+    installation_token = response.json()['token']
+
+Using GitHub App for Organization Backup
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Once you have an installation access token, use it with the ``--as-app`` flag::
+
+    # Full organization backup with GitHub App
+    export GITHUB_APP_TOKEN="ghs_xxxxxxxxxxxxxxxxxxxx"
+    github-backup YOUR_ORG \
+        --token $GITHUB_APP_TOKEN \
+        --as-app \
+        --organization \
+        --output-directory /backup/github-org \
+        --all \
+        --private \
+        --repositories \
+        --wikis \
+        --issues \
+        --pulls
+
+**Key differences when using** ``--as-app``:
+
+* Higher rate limits (5000 requests/hour per installation)
+* Access to all organization repositories (if app is installed with "All repositories")
+* Uses ``Authorization: token <installation_token>`` header format
+* Includes GitHub App API headers for proper app identification
+* Works with organization-wide permissions
+
+**Important Notes**:
+
+* Installation access tokens expire after 1 hour - you may need to refresh them for long-running backups
+* The app must be installed on the organization with appropriate repository access
+* Use classic personal access tokens (``-t TOKEN_CLASSIC``) with ``--as-app``, not fine-grained tokens
+* GitHub Apps have separate rate limits from personal access tokens
+
+
 Prefer SSH
 ~~~~~~~~~~
 
@@ -312,6 +452,86 @@ Debug an error/block or incomplete backup into a temporary directory. Omit "incr
 
     github-backup -f $FINE_ACCESS_TOKEN -o /tmp/github-backup/ -l debug -P --all-starred --starred --watched --followers --following --issues --issue-comments --issue-events --pulls --pull-comments --pull-commits --labels --milestones --repositories --wikis --releases --assets --pull-details --gists --starred-gists $GH_USER
 
+
+GitHub App Organization Backup Examples
+========================================
+
+Backup entire organization using GitHub App (recommended for organizations)::
+
+    export GITHUB_APP_TOKEN=ghs_xxxxxxxxxxxxxxxxxxxx  # Installation access token
+    ORGANIZATION=mycompany
+    
+    github-backup $ORGANIZATION \
+        --token $GITHUB_APP_TOKEN \
+        --as-app \
+        --organization \
+        --output-directory /backup/github-org \
+        --all \
+        --private \
+        --repositories \
+        --wikis \
+        --issues \
+        --pulls \
+        --issue-comments \
+        --pull-comments \
+        --labels \
+        --milestones
+
+Incremental organization backup with GitHub App for automated/cron scenarios::
+
+    export GITHUB_APP_TOKEN=ghs_xxxxxxxxxxxxxxxxxxxx
+    ORGANIZATION=mycompany
+    
+    github-backup $ORGANIZATION \
+        --token $GITHUB_APP_TOKEN \
+        --as-app \
+        --organization \
+        --output-directory /backup/github-org \
+        --incremental \
+        --private \
+        --repositories \
+        --wikis \
+        --issues \
+        --pulls \
+        --issue-comments \
+        --pull-comments \
+        --labels \
+        --milestones \
+        --log-level error
+
+Backup specific organization repository with comprehensive data using GitHub App::
+
+    export GITHUB_APP_TOKEN=ghs_xxxxxxxxxxxxxxxxxxxx
+    ORGANIZATION=mycompany
+    REPO=main-project
+    
+    github-backup $ORGANIZATION \
+        --token $GITHUB_APP_TOKEN \
+        --as-app \
+        --organization \
+        --repository $REPO \
+        --output-directory /backup/specific-repo \
+        --all \
+        --private \
+        --pull-details \
+        --releases \
+        --assets
+
+Organization backup excluding certain repositories::
+
+    export GITHUB_APP_TOKEN=ghs_xxxxxxxxxxxxxxxxxxxx
+    ORGANIZATION=mycompany
+    
+    github-backup $ORGANIZATION \
+        --token $GITHUB_APP_TOKEN \
+        --as-app \
+        --organization \
+        --output-directory /backup/github-org \
+        --all \
+        --private \
+        --exclude repo-to-skip another-repo-to-skip \
+        --throttle-limit 4500 \
+        --throttle-pause 0.8
 
 
 Development
