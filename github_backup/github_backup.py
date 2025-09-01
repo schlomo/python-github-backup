@@ -867,33 +867,6 @@ def _get_response(request, auth, template, args=None):
         except HTTPError as exc:
             errors, should_continue = _request_http_error(exc, auth, errors, args)  # noqa
             r = exc
-            
-            # If token was refreshed, we need to reconstruct the request with new auth
-            if should_continue and args and _github_app_credentials:
-                new_auth = get_auth(args, encode=not args.as_app)
-                if new_auth != auth:
-                    # Extract the original URL from the request 
-                    original_url = request.get_full_url()
-                    
-                    # Parse URL to get query parameters
-                    parsed_url = urlparse(original_url)
-                    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-                    
-                    # Reconstruct the request with new auth
-                    request = Request(original_url)
-                    
-                    # Set the new authorization header
-                    if not args.as_app:
-                        request.add_header("Authorization", f"Basic {new_auth.decode('ascii')}")
-                    else:
-                        if args.token_fine:
-                            request.add_header("Authorization", f"token {new_auth}")
-                        else:
-                            request.add_header("Authorization", f"token {new_auth}")
-                    
-                    request.add_header("User-Agent", f"github-backup/{VERSION}")
-                    auth = new_auth  # Update local auth variable
-                    
         except URLError as e:
             logger.warning(e.reason)
             should_continue, retry_timeout = _request_url_error(template, retry_timeout)
