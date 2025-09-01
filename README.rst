@@ -214,67 +214,145 @@ Creating a GitHub App for Organization Backup
    * Set "Where can this GitHub App be installed?" to "Only on this account" for security
    * Under "Repository access", choose "All repositories" to backup the entire organization
 
-4. **Generate Keys**:
+4. **Generate Keys and Secret**:
    
    * After creating the app, go to "General" tab and scroll down to "Private keys"
    * Click "Generate a private key" and download the ``.pem`` file safely
+   * Note your **App ID** (displayed at the top of the General tab)
+   * Click "Generate a new client secret" and copy the client secret (you'll need this for automated scripts)
 
 5. **Install the App**:
    
    * Go to "Install App" tab in your app settings
    * Click "Install" next to your organization
    * Choose "All repositories" or select specific repositories you want to backup
+   * Note the **Installation ID** from the URL after installation (e.g., ``https://github.com/organizations/ORG/settings/installations/12345678`` - the installation ID is ``12345678``)
 
-Generating Installation Access Tokens
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Generating Installation Access Tokens for Automated Backups
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-GitHub Apps use installation access tokens that expire after 1 hour. You'll need to generate these programmatically:
+GitHub Apps use installation access tokens that expire after 1 hour. For automated backups (e.g., cron jobs), you need to generate these tokens programmatically using your app's credentials.
 
-**Option 1: Using GitHub CLI (recommended for manual runs)**::
+**Complete Script for Token Generation**:
 
-    # Install GitHub CLI if not already installed
-    # https://cli.github.com/
-    
-    # Generate installation access token
-    gh auth token --hostname github.com --scopes repo
+Create a script (e.g., ``generate-github-token.py``) to generate installation access tokens::
 
-**Option 2: Using a script for automation**:
-
-You can create a script to generate tokens using your app's private key. Here's a basic approach using Python::
-
+    #!/usr/bin/env python3
     import jwt
     import time
     import requests
+    import os
+    import sys
     
-    # Your GitHub App details
-    app_id = "YOUR_APP_ID"
-    private_key_path = "path/to/your/private-key.pem"
-    installation_id = "YOUR_INSTALLATION_ID"  # Find this in app settings
+    # Your GitHub App details - set these as environment variables or modify here
+    APP_ID = os.environ.get('GITHUB_APP_ID', 'YOUR_APP_ID')
+    PRIVATE_KEY_PATH = os.environ.get('GITHUB_PRIVATE_KEY_PATH', '/path/to/your/private-key.pem')
+    INSTALLATION_ID = os.environ.get('GITHUB_INSTALLATION_ID', 'YOUR_INSTALLATION_ID')
     
-    # Generate JWT
-    with open(private_key_path, 'r') as key_file:
-        private_key = key_file.read()
+    def generate_installation_token():
+        # Read the private key
+        try:
+            with open(PRIVATE_KEY_PATH, 'r') as key_file:
+                private_key = key_file.read()
+        except FileNotFoundError:
+            print(f"Error: Private key file not found at {PRIVATE_KEY_PATH}")
+            sys.exit(1)
+        
+        # Generate JWT token
+        now = int(time.time())
+        payload = {
+            'iat': now - 60,  # Issued 1 minute in the past to avoid clock drift
+            'exp': now + 600,  # Expires in 10 minutes
+            'iss': APP_ID
+        }
+        
+        try:
+            jwt_token = jwt.encode(payload, private_key, algorithm='RS256')
+        except Exception as e:
+            print(f"Error generating JWT: {e}")
+            sys.exit(1)
+        
+        # Get installation access token
+        headers = {
+            'Authorization': f'Bearer {jwt_token}',
+            'Accept': 'application/vnd.github.v3+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+        }
+        
+        try:
+            response = requests.post(
+                f'https://api.github.com/app/installations/{INSTALLATION_ID}/access_tokens',
+                headers=headers
+            )
+            response.raise_for_status()
+            return response.json()['token']
+        except requests.exceptions.RequestException as e:
+            print(f"Error getting installation token: {e}")
+            if response.status_code == 404:
+                print("Check your installation ID - the app may not be installed or ID is incorrect")
+            sys.exit(1)
     
-    payload = {
-        'iat': int(time.time()),
-        'exp': int(time.time()) + 600,  # 10 minutes
-        'iss': app_id
-    }
+    if __name__ == '__main__':
+        token = generate_installation_token()
+        print(token)
+
+**Setup for Automated Cron Jobs**:
+
+1. **Install required Python packages**::
+
+    pip install PyJWT requests
+
+2. **Set up environment variables** (in your cron environment or script)::
+
+    export GITHUB_APP_ID="123456"
+    export GITHUB_PRIVATE_KEY_PATH="/secure/path/to/github-app-private-key.pem"
+    export GITHUB_INSTALLATION_ID="12345678"
+
+3. **Create a backup script** (e.g., ``nightly-backup.sh``)::
+
+    #!/bin/bash
+    set -e
     
-    jwt_token = jwt.encode(payload, private_key, algorithm='RS256')
+    # Generate fresh GitHub App installation token
+    GITHUB_APP_TOKEN=$(python3 /path/to/generate-github-token.py)
     
-    # Get installation access token
-    headers = {
-        'Authorization': f'Bearer {jwt_token}',
-        'Accept': 'application/vnd.github.v3+json'
-    }
+    if [ -z "$GITHUB_APP_TOKEN" ]; then
+        echo "Failed to generate GitHub App token"
+        exit 1
+    fi
     
-    response = requests.post(
-        f'https://api.github.com/app/installations/{installation_id}/access_tokens',
-        headers=headers
-    )
+    # Run the backup
+    github-backup YOUR_ORGANIZATION \
+        --token "$GITHUB_APP_TOKEN" \
+        --as-app \
+        --organization \
+        --output-directory /backup/github-org \
+        --incremental \
+        --private \
+        --repositories \
+        --wikis \
+        --issues \
+        --pulls \
+        --issue-comments \
+        --pull-comments \
+        --labels \
+        --milestones \
+        --log-level error
+
+4. **Add to crontab for nightly runs**::
+
+    # Edit crontab
+    crontab -e
     
-    installation_token = response.json()['token']
+    # Add this line for nightly backup at 2 AM
+    0 2 * * * /path/to/nightly-backup.sh >> /var/log/github-backup.log 2>&1
+
+**Finding Your App Credentials**:
+
+* **App ID**: Found in your GitHub App settings under "General" tab (top of page)
+* **Installation ID**: Found in the URL after installing the app: ``https://github.com/organizations/YOUR_ORG/settings/installations/INSTALLATION_ID``
+* **Private Key**: Downloaded as ``.pem`` file when you generate it in app settings
+* **Client Secret**: Generated in app settings (not needed for this token generation method)
 
 Using GitHub App for Organization Backup
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
