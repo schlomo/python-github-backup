@@ -96,7 +96,9 @@ def logging_subprocess(
             if not logger:
                 continue
             if not (io == child.stderr and not line):
-                logger.log(log_level[io], line[:-1])
+                # Decode bytes to string for proper logging
+                line_str = line.decode('utf-8', errors='replace').rstrip('\n')
+                logger.log(log_level[io], line_str)
 
     # keep checking stdout/stderr until the child exits
     while child.poll() is None:
@@ -526,8 +528,9 @@ def get_auth(args, encode=True, for_git_cli=False):
             logger.warning("GitHub App credentials provided but --as-app not specified. Enabling app authentication.")
             args.as_app = True
         
-        # Store credentials globally for token refresh
-        _github_app_credentials = (args.app_id, args.installation_id, args.private_key)
+        # Store credentials globally for token refresh (only if not already set)
+        if not _github_app_credentials:
+            _github_app_credentials = (args.app_id, args.installation_id, args.private_key)
         
         # Get fresh token
         token = get_or_refresh_github_app_token()
@@ -623,6 +626,10 @@ def generate_github_app_token(app_id, installation_id, private_key):
         # Load private key
         if private_key.startswith(FILE_URI_PREFIX):
             private_key = read_file_contents(private_key)
+        elif os.path.exists(private_key):
+            # If it's a file path, convert to file:// format
+            file_uri = f"{FILE_URI_PREFIX}{private_key}"
+            private_key = read_file_contents(file_uri)
         
         # Create JWT payload
         now = int(time.time())
@@ -631,7 +638,6 @@ def generate_github_app_token(app_id, installation_id, private_key):
             "exp": now + 600,  # Expires in 10 minutes (max allowed)
             "iss": int(app_id)  # Issuer (GitHub App ID)
         }
-        
         # Generate JWT
         jwt_token = jwt.encode(payload, private_key, algorithm="RS256")
         
@@ -668,16 +674,24 @@ def get_or_refresh_github_app_token():
         
     app_id, installation_id, private_key = _github_app_credentials
     
-    # Check if we need a new token (5 minutes buffer before expiry)
-    now = datetime.now().replace(tzinfo=None)
+    # Simple approach: Check if token exists and is not expired (with 5-minute buffer)
+    # Convert both times to UTC for comparison (GitHub API returns UTC times)
+    now_utc = datetime.utcnow()
+    expires_utc = _github_app_token_expires.replace(tzinfo=None) if _github_app_token_expires else None
+    
+    # Generate new token if:
+    # 1. No token exists
+    # 2. Token is expired or will expire within 5 minutes
     if (_github_app_token is None or 
-        _github_app_token_expires is None or 
-        now >= (_github_app_token_expires.replace(tzinfo=None) - timedelta(minutes=5))):
+        expires_utc is None or 
+        now_utc >= (expires_utc - timedelta(minutes=5))):
         
         logger.info("Generating new GitHub App token...")
         _github_app_token, _github_app_token_expires = generate_github_app_token(
             app_id, installation_id, private_key
         )
+    else:
+        logger.debug(f"Using cached token, expires at: {_github_app_token_expires}")
     
     return _github_app_token
 
@@ -701,7 +715,7 @@ def get_github_host(args):
 
 
 def read_file_contents(file_uri):
-    return open(file_uri[len(FILE_URI_PREFIX) :], "rt").readline().strip()
+    return open(file_uri[len(FILE_URI_PREFIX) :], "rt").read()
 
 
 def get_github_repo_url(args, repository):
@@ -748,13 +762,13 @@ def retrieve_data_gen(args, template, query_args=None, single_request=False):
         else:
             page = page + 1
             request_page, request_per_page = page, per_page
-
-        # Get fresh auth on each request to handle token refresh
+        
+        # Always get fresh auth before each API call - caching handles optimization
         auth = get_auth(args, encode=not args.as_app)
         
         request = _construct_request(
-            request_page,
             request_per_page,
+            request_page,
             query_args,
             template,
             auth,
