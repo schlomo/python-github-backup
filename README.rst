@@ -171,116 +171,111 @@ Customise the permissions for your use case, but for a personal account full bac
 **Repository permissions**: Read access to contents, issues, metadata, pull requests, and webhooks.
 
 
-Prefer SSH
-~~~~~~~~~~
 
-If cloning repos is enabled with ``--repositories``, ``--all-starred``, ``--wikis``, ``--gists``, ``--starred-gists`` using the ``--prefer-ssh`` argument will use ssh for cloning the git repos, but all other connections will still use their own protocol, e.g. API requests for issues uses HTTPS.
+GitHub App Authentication
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-To clone with SSH, you'll need SSH authentication setup `as usual with Github <https://docs.github.com/en/authentication/connecting-to-github-with-ssh>`_, e.g. via SSH public and private keys.
+For backing up entire organizations, **GitHub App authentication** (``--as-app``) is the recommended approach as it provides:
 
+* **Higher rate limits**: 5000 requests/hour per installation vs standard personal token limits
+* **Broader access**: Organization-wide repository access when installed with "All repositories"  
+* **Enterprise-friendly**: Proper app-based authentication for organizational backup scenarios
+* **Automated token management**: No need to manually handle token expiry during long backups
 
-Using the Keychain on Mac OSX
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Note: On Mac OSX the token can be stored securely in the user's keychain. To do this:
+Creating a GitHub App for Organization Backup
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-1. Open Keychain from "Applications -> Utilities -> Keychain Access"
-2. Add a new password item using "File -> New Password Item"
-3. Enter a name in the "Keychain Item Name" box. You must provide this name to github-backup using the --keychain-name argument.
-4. Enter an account name in the "Account Name" box, enter your Github username as set above. You must provide this name to github-backup using the --keychain-account argument.
-5. Enter your Github personal access token in the "Password" box
+1. **Create the GitHub App**:
+   
+   * Go to your organization's settings: ``https://github.com/organizations/YOUR_ORG/settings/apps``
+   * Click "New GitHub App"
+   * Fill in basic information:
+     - App name: e.g., "Organization Backup Tool" 
+     - Homepage URL: Can be your organization's website
+     - Webhook URL: Not required, can leave blank or use a placeholder
 
-Note:  When you run github-backup, you will be asked whether you want to allow "security" to use your confidential information stored in your keychain. You have two options:
+2. **Configure Permissions**:
 
-1. **Allow:** In this case you will need to click "Allow" each time you run `github-backup`
-2. **Always Allow:** In this case, you will not be asked for permission when you run `github-backup` in future. This is less secure, but is required if you want to schedule `github-backup` to run automatically
+   **Repository permissions** (select "Read" access for):
+   
+   * Contents
+   * Issues  
+   * Metadata
+   * Pull requests
+   * Webhooks
+   * Repository projects (if backing up projects)
 
+   **Organization permissions** (select "Read" access for):
+   
+   * Members
+   * Metadata
 
-Github Rate-limit and Throttling
---------------------------------
+   **Account permissions** (select "Read" access for):
+   
+   * Starring
+   * Watching
 
-"github-backup" will automatically throttle itself based on feedback from the Github API. 
+3. **Installation Settings**:
+   
+   * Set "Where can this GitHub App be installed?" to "Only on this account" for security
+   * Under "Repository access", choose "All repositories" to backup the entire organization
 
-Their API is usually rate-limited to 5000 calls per hour. The API will ask github-backup to pause until a specific time when the limit is reset again (at the start of the next hour). This continues until the backup is complete.
+4. **Generate Private Key**:
+   
+   * After creating the app, scroll down to "Private keys" section
+   * Click "Generate a private key" 
+   * Download the ``.pem`` file and store it securely
 
-During a large backup, such as ``--all-starred``, and on a fast connection this can result in (~20 min) pauses with bursts of API calls periodically maxing out the API limit. If this is not suitable `it has been observed <https://github.com/josegonzalez/python-github-backup/issues/76#issuecomment-636158717>`_ under real-world conditions that overriding the throttle with ``--throttle-limit 5000 --throttle-pause 0.6`` provides a smooth rate across the hour, although a ``--throttle-pause 0.72`` (3600 seconds [1 hour] / 5000 limit) is theoretically safer to prevent large rate-limit pauses.
+5. **Install the App**:
+   
+   * Go to the "Install App" tab in your GitHub App settings
+   * Click "Install" next to your organization
+   * Choose "All repositories" for comprehensive backup access
 
+6. **Get Required Information**:
+   
+   * **App ID**: Found in your GitHub App settings under "General" tab (the number at the top)
+   * **Installation ID**: After installing, the URL will show the installation ID: ``/organizations/YOUR_ORG/settings/installations/INSTALLATION_ID``
+   * **Private Key**: The ``.pem`` file you downloaded
 
-About Git LFS
--------------
+Using GitHub App Authentication
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When you use the ``--lfs`` option, you will need to make sure you have Git LFS installed.
+With the GitHub App created and installed, you can use it directly with github-backup::
 
-Instructions on how to do this can be found on https://git-lfs.github.com.
+    github-backup YOUR_ORG \
+        --app-id 123456 \
+        --installation-id 789012 \
+        --private-key /path/to/your-app.pem \
+        --organization \
+        --repositories \
+        --output-directory /tmp/backup
 
+Or using environment variables for security::
 
-Run in Docker container
------------------------
+    export GITHUB_APP_ID=123456
+    export GITHUB_INSTALLATION_ID=789012  
+    export GITHUB_PRIVATE_KEY=/path/to/your-app.pem
+    
+    github-backup YOUR_ORG \
+        --app-id $GITHUB_APP_ID \
+        --installation-id $GITHUB_INSTALLATION_ID \
+        --private-key $GITHUB_PRIVATE_KEY \
+        --organization \
+        --repositories \
+        --all
 
-To run the tool in a Docker container use the following command:
+**Key Benefits**:
 
-    sudo docker run --rm -v /path/to/backup:/data --name github-backup ghcr.io/josegonzalez/python-github-backup -o /data $OPTIONS $USER
+* **Automatic token management**: The tool automatically generates and refreshes installation access tokens as needed
+* **No manual token handling**: No need for external scripts or cron job token generation
+* **Handles long backups**: Token expiry is automatically handled during multi-hour organization backups
+* **Docker-friendly**: Simple to use in containerized environments with mounted private key files
 
-Gotchas / Known-issues
-======================
+**For automated/cron backups**, simply set up the same command in your cron job::
 
-All is not everything
----------------------
-
-The ``--all`` argument does not include: cloning private repos (``-P, --private``), cloning forks (``-F, --fork``), cloning starred repositories (``--all-starred``), ``--pull-details``, cloning LFS repositories (``--lfs``), cloning gists (``--gists``) or cloning starred gist repos (``--starred-gists``). See examples for more.
-
-Cloning all starred size
-------------------------
-
-Using the ``--all-starred`` argument to clone all starred repositories may use a large amount of storage space, especially if ``--all`` or more arguments are used. e.g. commonly starred repos can have tens of thousands of issues, many large assets and the repo itself etc. Consider just storing links to starred repos in JSON format with ``--starred``.
-
-Incremental Backup
-------------------
-
-Using (``-i, --incremental``) will only request new data from the API **since the last run (successful or not)**. e.g. only request issues from the API since the last run. 
-
-This means any blocking errors on previous runs can cause a large amount of missing data in backups.
-
-Using (``--incremental-by-files``) will request new data from the API **based on when the file was modified on filesystem**. e.g. if you modify the file yourself you may miss something.
-
-Still saver than the previous version.
-
-Specifically, issues and pull requests are handled like this.
-
-Known blocking errors
----------------------
-
-Some errors will block the backup run by exiting the script. e.g. receiving a 403 Forbidden error from the Github API.
-
-If the incremental argument is used, this will result in the next backup only requesting API data since the last blocked/failed run. Potentially causing unexpected large amounts of missing data.
-
-It's therefore recommended to only use the incremental argument if the output/result is being actively monitored, or complimented with periodic full non-incremental runs, to avoid unexpected missing data in a regular backup runs.
-
-1. **Starred public repo hooks blocking**
-
-   Since the ``--all`` argument includes ``--hooks``, if you use ``--all`` and ``--all-starred`` together to clone a users starred public repositories, the backup will likely error and block the backup continuing. 
-
-   This is due to needing the correct permission for ``--hooks`` on public repos.
-
-
-"bare" is actually "mirror"
----------------------------
-
-Using the bare clone argument (``--bare``) will actually call git's ``clone --mirror`` command. There's a subtle difference between `bare <https://www.git-scm.com/docs/git-clone#Documentation/git-clone.txt---bare>`_ and `mirror <https://www.git-scm.com/docs/git-clone#Documentation/git-clone.txt---mirror>`_ clone.
-
-*From git docs "Compared to --bare, --mirror not only maps local branches of the source to local branches of the target, it maps all refs (including remote-tracking branches, notes etc.) and sets up a refspec configuration such that all these refs are overwritten by a git remote update in the target repository."*
-
-
-Starred gists vs starred repo behaviour
----------------------------------------
-
-The starred normal repo cloning (``--all-starred``) argument stores starred repos separately to the users own repositories. However, using ``--starred-gists`` will store starred gists within the same directory as the users own gists ``--gists``. Also, all gist repo directory names are IDs not the gist's name.
-
-
-Skip existing on incomplete backups
------------------------------------
-
-The ``--skip-existing`` argument will skip a backup if the directory already exists, even if the backup in that directory failed (perhaps due to a blocking error). This may result in unexpected missing data in a regular backup.
-
+    # Daily backup at 2 AM
+    0 2 * * * github-backup YOUR_ORG --app-id $GITHUB_APP_ID --installation-id $GITHUB_INSTALLATION_ID --private-key $GITHUB_PRIVATE_KEY --organization --repositories --output-directory /backup/github
 
 Github Backup Examples
 ======================
@@ -314,6 +309,59 @@ Debug an error/block or incomplete backup into a temporary directory. Omit "incr
 
 
 
+GitHub App Organization Backup Examples
+========================================
+
+Backup entire organization using GitHub App (recommended for organizations)::
+
+    github-backup mycompany \
+        --app-id 123456 \
+        --installation-id 789012 \
+        --private-key /path/to/app-private-key.pem \
+        --organization \
+        --repositories \
+        --issues \
+        --pulls \
+        --wikis \
+        --output-directory /backup/github-org
+
+Incremental organization backup with GitHub App for automated/cron scenarios::
+
+    github-backup mycompany \
+        --app-id 123456 \
+        --installation-id 789012 \
+        --private-key /path/to/app-private-key.pem \
+        --organization \
+        --repositories \
+        --incremental \
+        --output-directory /backup/github-org
+
+Backup specific organization repository with comprehensive data using GitHub App::
+
+    github-backup mycompany \
+        --app-id 123456 \
+        --installation-id 789012 \
+        --private-key /path/to/app-private-key.pem \
+        --organization \
+        --repository main-project \
+        --repositories \
+        --issues \
+        --pulls \
+        --wikis \
+        --issue-comments \
+        --pull-comments \
+        --output-directory /backup/github-repo
+
+Organization backup excluding certain repositories::
+
+    github-backup mycompany \
+        --app-id 123456 \
+        --installation-id 789012 \
+        --private-key /path/to/app-private-key.pem \
+        --organization \
+        --repositories \
+        --exclude repo-to-skip another-repo-to-skip \
+        --output-directory /backup/github-org
 Development
 ===========
 
